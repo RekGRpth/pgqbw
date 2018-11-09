@@ -27,6 +27,14 @@ static int check_period = 60;
 static int retry_period = 30;
 static int maint_period = 120;
 static int ticker_period = 1;
+static unsigned long int time_time = 0;
+static unsigned long int next_ticker = 0;
+static unsigned long int next_maint = 0;
+static unsigned long int next_retry = 0;
+static unsigned long int next_stats = 0;
+static unsigned long int n_ticks = 0;
+static unsigned long int n_maint = 0;
+static unsigned long int n_retry = 0;
 
 static void sighup(SIGNAL_ARGS) {
     int save_errno = errno;
@@ -82,12 +90,30 @@ void ticker(Datum arg) {
     BackgroundWorkerInitializeConnection(datname, usename, 0);
     initialize_ticker();
     while (!got_sigterm) {
-        int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, min(retry_period, maint_period, ticker_period) * 1000L, PG_WAIT_EXTENSION);
+        int period = min(retry_period, maint_period, ticker_period);
+        int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, period * 1000L, PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
         if (rc & WL_POSTMASTER_DEATH) proc_exit(1);
+        if (rc & WL_TIMEOUT) time_time += period;
         if (got_sighup) {
             got_sighup = false;
             ProcessConfigFile(PGC_SIGHUP);
+        }
+        if (time_time >= next_retry) {
+            n_retry++;
+            next_retry = time_time + retry_period;
+        }
+        if (time_time >= next_maint) {
+            n_maint++;
+            next_maint = time_time + maint_period;
+        }
+        if (time_time >= next_ticker) {
+            n_ticks++;
+            next_ticker = time_time + ticker_period;
+        }
+        if (time_time >= next_stats) {
+            elog(LOG, "datname=%s, usename=%s, time_time=%lu, n_ticks=%lu, n_maint=%lu, n_retry=%lu", datname, usename, time_time, n_ticks, n_maint, n_retry);
+            next_stats = time_time + stats_period;
         }
     }
     elog(LOG, "ticker finished");
