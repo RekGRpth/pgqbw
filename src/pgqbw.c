@@ -215,11 +215,11 @@ void _PG_init(void) {
     if (!process_shared_preload_libraries_in_progress) ereport(ERROR, (errmsg("pgqbw can only be loaded via shared_preload_libraries"), errhint("Add pgqbw to the shared_preload_libraries configuration variable in postgresql.conf.")));
     DefineCustomStringVariable("pgqbw.initial_database", "startup database to query other databases", NULL, &initial_database, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("pgqbw.initial_username", "startup username to query other databases", NULL, &initial_username, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("pgqbw.stats_period", "how often to print statistics", NULL, &stats_period, 30, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.check_period", "how often to check for new databases", NULL, &check_period, 60, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.retry_period", "how often to flush retry queue", NULL, &retry_period, 30, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.maint_period", "how often to do maintentance", NULL, &maint_period, 120, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.ticker_period", "how often to run ticker", NULL, &ticker_period, 1, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("pgqbw.stats_period", "how often to print statistics", NULL, &stats_period, 30, min(retry_period, maint_period, ticker_period), INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     MemSet(&worker, 0, sizeof(BackgroundWorker));
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
