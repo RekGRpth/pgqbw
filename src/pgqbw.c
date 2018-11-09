@@ -121,12 +121,34 @@ void ticker(Datum arg) {
             next_maint = time_time + maint_period;
         }
         if (time_time >= next_retry) {
-            n_retry++;
+            SetCurrentStatementStartTimestamp();
+            StartTransactionCommand();
+            SPI_connect();
+            PushActiveSnapshot(GetTransactionSnapshot());
+            sql = "SELECT * FROM pgq.maint_retry_events();";
+            pgstat_report_activity(STATE_RUNNING, sql);
+            for (int retry = 1; retry; ) {
+                int ret = SPI_execute(sql, false, 0);
+                if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+                if (SPI_processed == 1) {
+                    bool isnull;
+                    retry = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+                    n_retry += retry;
+                } else retry = 0;
+            }
+            SPI_finish();
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+            pgstat_report_stat(false);
+            pgstat_report_activity(STATE_IDLE, NULL);
             next_retry = time_time + retry_period;
         }
         if (time_time >= next_stats) {
             elog(LOG, "datname=%s, usename=%s, time_time=%lu, n_ticks=%lu, n_maint=%lu, n_retry=%lu", datname, usename, time_time, n_ticks, n_maint, n_retry);
             next_stats = time_time + stats_period;
+            n_ticks = 0;
+            n_maint = 0;
+            n_retry = 0;
         }
     }
     elog(LOG, "ticker finished");
