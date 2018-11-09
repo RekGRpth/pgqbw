@@ -66,7 +66,7 @@ static void initialize_ticker() {
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
     pgstat_report_activity(STATE_RUNNING, sql);
-    ret = SPI_execute(sql, true, 0);
+    ret = SPI_execute(sql, false, 0);
     if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
     lock = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
@@ -128,19 +128,19 @@ void ticker(Datum arg) {
             ret = SPI_execute(sql, false, 0);
             if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
             resetStringInfo(&buf);
-            for (unsigned i = 0; i < SPI_processed; i++) {
-                bool isnull;
-                char *func_name = NULL, *func_arg = NULL;
-                func_name = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
-                func_arg = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
-                elog(LOG, "datname=%s, usename=%s, func_name=%s, func_arg=%s", datname, usename, func_name, func_arg);
+            for (unsigned int i = 0; i < SPI_processed; i++) {
+                char *func_name = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+                char *func_arg = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
                 if (!strncasecmp(func_name, "vacuum", sizeof("vacuum") - 1)) {
                     appendStringInfo(&buf, "%s \"%s\";", func_name, func_arg);
-                } else if (isnull) {
+                } else if (func_arg == NULL) {
                     appendStringInfo(&buf, "SELECT %s();", func_name);
                 } else {
                     appendStringInfo(&buf, "SELECT %s('%s');", func_name, func_arg);
                 }
+                elog(LOG, "datname=%s, usename=%s, buf.data=%s", datname, usename, buf.data);
+                if (func_name != NULL) pfree(func_name);
+                if (func_arg != NULL) pfree(func_arg);
                 n_maint++;
             }
             SPI_finish();
@@ -155,7 +155,7 @@ void ticker(Datum arg) {
             StartTransactionCommand();
             SPI_connect();
             PushActiveSnapshot(GetTransactionSnapshot());
-            sql = "SELECT * FROM pgq.maint_retry_events();";
+            sql = "SELECT * FROM pgq.maint_retry_events()";
             pgstat_report_activity(STATE_RUNNING, sql);
             for (int retry = 1; retry; ) {
                 int ret = SPI_execute(sql, false, 0);
@@ -191,7 +191,7 @@ static void initialize_launcher() {
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
     pgstat_report_activity(STATE_RUNNING, sql);
-    ret = SPI_execute(sql, true, 0);
+    ret = SPI_execute(sql, false, 0);
     if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
     ntup = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
@@ -275,12 +275,12 @@ void launcher(Datum main_arg) {
         pgstat_report_activity(STATE_RUNNING, sql);
         ret = SPI_execute(sql, false, 0);
         if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
-        for (unsigned i = 0; i < SPI_processed; i++) {
+        for (unsigned int i = 0; i < SPI_processed; i++) {
             bool isnull;
-            char *datname = NULL, *usename = NULL;
-            datname = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
-            usename = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
-            elog(LOG, "datname=%s, usename=%s", datname, usename);
+//            char *datname = NULL, *usename = NULL;
+            char *datname = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+            char *usename = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+//            elog(LOG, "datname=%s, usename=%s", datname, usename);
             launch_ticker(datname, usename);
         }
         SPI_finish();
