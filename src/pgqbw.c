@@ -138,10 +138,17 @@ void ticker(Datum arg) {
                 } else {
                     appendStringInfo(&buf, "SELECT %s();", func_name);
                 }
-                elog(LOG, "datname=%s, usename=%s, buf.data=%s", datname, usename, buf.data);
+//                elog(LOG, "datname=%s, usename=%s, buf.data=%s", datname, usename, buf.data);
                 if (func_name != NULL) pfree(func_name);
                 if (func_arg != NULL) pfree(func_arg);
                 n_maint++;
+            }
+            if (buf.len > 0) {
+                sql = buf.data;
+                elog(LOG, "datname=%s, usename=%s, sql=%s", datname, usename, sql);
+                pgstat_report_activity(STATE_RUNNING, sql);
+                ret = SPI_execute(sql, false, 0);
+                if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
             }
             SPI_finish();
             PopActiveSnapshot();
@@ -246,13 +253,13 @@ static void launch_ticker(char *datname, char *usename) {
 
 void launcher(Datum main_arg) {
     char *sql = "WITH subquery AS ( "
-        "SELECT datname, usename, "
-        "(SELECT lock FROM dblink.dblink('dbname='||datname||' user='||usename, 'SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = ''pgq'';') AS (lock bool)) AS lock "
+        "SELECT datname, "
+        "(SELECT usename FROM dblink.dblink('dbname='||datname||' user='||usename, 'SELECT case when pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) then usename else null end as usename FROM pg_database, pg_namespace, pg_user WHERE datname = current_catalog AND nspname = ''pgq'' and usesysid = nspowner') AS (usename name)) AS usename "
         "FROM pg_database "
         "INNER JOIN pg_user ON usesysid = datdba "
         "WHERE NOT datistemplate "
         "AND datallowconn "
-    ") SELECT datname, usename FROM subquery WHERE lock IS NOT NULL and lock";
+    ") SELECT datname, usename FROM subquery WHERE usename IS NOT NULL";
     elog(LOG, "launcher started initial_database=%s, initial_username=%s", initial_database, initial_username);
     pqsignal(SIGHUP, sighup);
     pqsignal(SIGTERM, sigterm);
