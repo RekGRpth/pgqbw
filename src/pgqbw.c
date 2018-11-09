@@ -24,7 +24,7 @@ void pgqbw_main(Datum arg);
 
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
-static volatile sig_atomic_t got_sigusr1 = false;
+//static volatile sig_atomic_t got_sigusr1 = false;
 static char *initial_database = NULL;
 static char *initial_username = NULL;
 static int check_period = 60;
@@ -44,12 +44,12 @@ static void pgqbw_sigterm(SIGNAL_ARGS) {
     errno = save_errno;
 }
 
-static void pgqbw_sigusr1(SIGNAL_ARGS) {
+/*static void pgqbw_sigusr1(SIGNAL_ARGS) {
     int save_errno = errno;
     got_sigusr1 = true;
     SetLatch(MyLatch);
     errno = save_errno;
-}
+}*/
 
 static void initialize_pgqbw() {
     int ret, ntup;
@@ -85,18 +85,19 @@ void pgqbw_main(Datum main_arg) {
     StringInfoData buf;
     pqsignal(SIGHUP, pgqbw_sighup);
     pqsignal(SIGTERM, pgqbw_sigterm);
-    pqsignal(SIGUSR1, pgqbw_sigusr1);
+//    pqsignal(SIGUSR1, pgqbw_sigusr1);
     BackgroundWorkerUnblockSignals();
     BackgroundWorkerInitializeConnection(initial_database, initial_username, 0);
     initialize_pgqbw();
     initStringInfo(&buf);
-    appendStringInfo(&buf, "WITH s AS ("
-    "    SELECT  datname,"
-    "            (SELECT * FROM dblink.dblink('dbname='||datname, 'SELECT nspname FROM pg_namespace WHERE nspname = ''pgq''') AS (text TEXT)) AS nspname"
-    "    FROM    pg_database"
-    "    WHERE   NOT datistemplate"
-    "    AND     datallowconn"
-    ") SELECT datname FROM s WHERE nspname IS NOT NULL");
+    appendStringInfo(&buf, "WITH subquery AS ( "
+        "SELECT datname, usename, "
+        "(SELECT nspname FROM dblink.dblink('dbname='||datname, 'SELECT nspname FROM pg_namespace WHERE nspname = ''pgq''') AS (nspname TEXT)) AS nspname "
+        "FROM pg_database "
+        "INNER JOIN pg_user ON usesysid = datdba "
+        "WHERE NOT datistemplate "
+        "AND datallowconn "
+    ") SELECT datname, usename FROM subquery WHERE nspname IS NOT NULL");
 //    EnableNotifyInterrupt();
 //    pgstat_report_activity(STATE_RUNNING, "background_worker");
 //    StartTransactionCommand();
@@ -108,7 +109,7 @@ void pgqbw_main(Datum main_arg) {
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, check_period * 1000L, PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
         if (rc & WL_POSTMASTER_DEATH) proc_exit(1);
-        CHECK_FOR_INTERRUPTS();
+//        CHECK_FOR_INTERRUPTS();
         if (got_sighup) {
             got_sighup = false;
             ProcessConfigFile(PGC_SIGHUP);
@@ -127,8 +128,10 @@ void pgqbw_main(Datum main_arg) {
         if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: buf.data=%s, ret=%d", buf.data, ret);
         for (unsigned i = 0; i < SPI_processed; i++) {
             bool isnull;
-            char *datname = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
-            elog(LOG, "datname=%s", datname);
+            char *datname = NULL, *usename = NULL;
+            datname = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+            usename = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+            elog(LOG, "datname=%s, usename=%s", datname, usename);
         }
         SPI_finish();
         PopActiveSnapshot();
@@ -136,8 +139,8 @@ void pgqbw_main(Datum main_arg) {
         pgstat_report_stat(false);
         pgstat_report_activity(STATE_IDLE, NULL);
     }
-//    elog(LOG, "background_worker: finished");
-    proc_exit(1);
+    elog(LOG, "pgqbw_main finished");
+    proc_exit(0);
 }
 
 /*static void store_notification(ErrorData *edata) {
@@ -158,7 +161,7 @@ void _PG_init(void) {
     snprintf(worker.bgw_library_name, BGW_MAXLEN, "pgqbw");
     snprintf(worker.bgw_function_name, BGW_MAXLEN, "pgqbw_main");
     snprintf(worker.bgw_name, BGW_MAXLEN, "queue background worker");
-    snprintf(worker.bgw_type, BGW_MAXLEN, "pgqbw");
+    snprintf(worker.bgw_type, BGW_MAXLEN, "queue background worker");
     worker.bgw_notify_pid = 0;
 //    worker.bgw_main = pgqbw_main;
     worker.bgw_main_arg = (Datum) 0;
