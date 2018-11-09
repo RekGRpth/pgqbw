@@ -79,6 +79,7 @@ static void initialize_ticker() {
 }
 
 void ticker(Datum arg) {
+    StringInfoData buf;
     char *sql;
     char *datname = MyBgworkerEntry->bgw_extra;
     char *usename = datname + strlen(datname) + 1;
@@ -88,6 +89,7 @@ void ticker(Datum arg) {
     BackgroundWorkerUnblockSignals();
     BackgroundWorkerInitializeConnection(datname, usename, 0);
     initialize_ticker();
+    initStringInfo(&buf);
     while (!got_sigterm) {
         int ret;
         int period = min(retry_period, maint_period, ticker_period);
@@ -125,12 +127,20 @@ void ticker(Datum arg) {
             pgstat_report_activity(STATE_RUNNING, sql);
             ret = SPI_execute(sql, false, 0);
             if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+            resetStringInfo(&buf);
             for (unsigned i = 0; i < SPI_processed; i++) {
                 bool isnull;
                 char *func_name = NULL, *func_arg = NULL;
                 func_name = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
                 func_arg = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
                 elog(LOG, "datname=%s, usename=%s, func_name=%s, func_arg=%s", datname, usename, func_name, func_arg);
+                if (!strncasecmp(func_name, "vacuum", sizeof("vacuum") - 1)) {
+                    appendStringInfo(&buf, "%s \"%s\";", func_name, func_arg);
+                } else if (isnull) {
+                    appendStringInfo(&buf, "SELECT %s();", func_name);
+                } else {
+                    appendStringInfo(&buf, "SELECT %s('%s');", func_name, func_arg);
+                }
                 n_maint++;
             }
             SPI_finish();
