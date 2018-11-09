@@ -48,6 +48,29 @@ static inline int min(int a, int b, int c) {
     return m;
 }
 
+static void initialize_ticker() {
+    int ret;
+    bool isnull, lock;
+    StringInfoData buf;
+    SetCurrentStatementStartTimestamp();
+    StartTransactionCommand();
+    SPI_connect();
+    PushActiveSnapshot(GetTransactionSnapshot());
+    initStringInfo(&buf);
+    appendStringInfo(&buf, "SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq';");
+    pgstat_report_activity(STATE_RUNNING, buf.data);
+    ret = SPI_execute(buf.data, true, 0);
+    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: buf.data=%s, ret=%d", buf.data, ret);
+    if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
+    lock = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+    if (isnull) elog(FATAL, "isnull");
+    if (!lock) elog(FATAL, "already running");
+    SPI_finish();
+    PopActiveSnapshot();
+    CommitTransactionCommand();
+    pgstat_report_activity(STATE_IDLE, NULL);
+}
+
 void ticker(Datum arg) {
     char *datname = MyBgworkerEntry->bgw_extra;
     char *usename = datname + strlen(datname) + 1;
@@ -56,6 +79,7 @@ void ticker(Datum arg) {
     pqsignal(SIGTERM, sigterm);
     BackgroundWorkerUnblockSignals();
     BackgroundWorkerInitializeConnection(datname, usename, 0);
+    initialize_ticker();
     while (!got_sigterm) {
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, min(retry_period, maint_period, ticker_period) * 1000L, PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
@@ -110,8 +134,8 @@ static void launch_ticker(char *datname, char *usename) {
     worker.bgw_restart_time = 10;
     snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
     snprintf(worker.bgw_function_name, sizeof("ticker"), "ticker");
-    snprintf(worker.bgw_name, BGW_MAXLEN, "%s %s ticker background worker", datname, usename);
-    snprintf(worker.bgw_type, sizeof("ticker background worker"), "ticker background worker");
+    snprintf(worker.bgw_name, BGW_MAXLEN, "%s %s pgqbw worker", datname, usename);
+    snprintf(worker.bgw_type, sizeof("pgqbw worker"), "pgqbw worker");
     snprintf(worker.bgw_extra + snprintf(worker.bgw_extra, strlen(datname) + 1, "%s", datname) + 1, strlen(usename) + 1, "%s", usename);
     worker.bgw_notify_pid = MyProcPid;
     worker.bgw_main_arg = (Datum) 0;
@@ -144,12 +168,12 @@ void launcher(Datum main_arg) {
     initStringInfo(&buf);
     appendStringInfo(&buf, "WITH subquery AS ( "
         "SELECT datname, usename, "
-        "(SELECT nspname FROM dblink.dblink('dbname='||datname, 'SELECT nspname FROM pg_namespace WHERE nspname = ''pgq''') AS (nspname TEXT)) AS nspname "
+        "(SELECT lock FROM dblink.dblink('dbname='||datname, 'SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = ''pgq'';') AS (lock bool)) AS lock "
         "FROM pg_database "
         "INNER JOIN pg_user ON usesysid = datdba "
         "WHERE NOT datistemplate "
         "AND datallowconn "
-    ") SELECT datname, usename FROM subquery WHERE nspname IS NOT NULL");
+    ") SELECT datname, usename FROM subquery WHERE lock IS NOT NULL and lock");
     while (!got_sigterm) {
         int ret;
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, check_period * 1000L, PG_WAIT_EXTENSION);
@@ -200,8 +224,8 @@ void _PG_init(void) {
     worker.bgw_restart_time = 10;
     snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
     snprintf(worker.bgw_function_name, sizeof("launcher"), "launcher");
-    snprintf(worker.bgw_name, sizeof("queue background worker launcher"), "queue background worker launcher");
-    snprintf(worker.bgw_type, sizeof("queue background worker launcher"), "queue background worker launcher");
+    snprintf(worker.bgw_name, sizeof("pgqbw launcher"), "pgqbw launcher");
+    snprintf(worker.bgw_type, sizeof("pgqbw launcher"), "pgqbw launcher");
     worker.bgw_notify_pid = 0;
     worker.bgw_main_arg = (Datum) 0;
     RegisterBackgroundWorker(&worker);
