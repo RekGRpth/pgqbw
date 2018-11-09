@@ -15,41 +15,61 @@
 PG_MODULE_MAGIC;
 
 void _PG_init(void);
-void pgqbw_main(Datum arg);
-void pgqbw_ticker(Datum arg);
+void launcher(Datum arg);
+void ticker(Datum arg);
 
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 static char *initial_database = NULL;
 static char *initial_username = NULL;
 static int check_period = 60;
+static int retry_period = 30;
+static int maint_period = 120;
+static int ticker_period = 1;
 
-static void pgqbw_sighup(SIGNAL_ARGS) {
+static void sighup(SIGNAL_ARGS) {
     int save_errno = errno;
     got_sighup = true;
     SetLatch(MyLatch);
     errno = save_errno;
 }
 
-static void pgqbw_sigterm(SIGNAL_ARGS) {
+static void sigterm(SIGNAL_ARGS) {
     int save_errno = errno;
     got_sigterm = true;
     SetLatch(MyLatch);
     errno = save_errno;
 }
 
-void pgqbw_ticker(Datum arg) {
+static inline int min(int a, int b, int c) {
+    int m = a;
+    if (m > b) m = b;
+    if (m > c) return c;
+    return m;
+}
+
+void ticker(Datum arg) {
     char *datname = MyBgworkerEntry->bgw_extra;
     char *usename = datname + strlen(datname) + 1;
     elog(LOG, "datname=%s, usename=%s", datname, usename);
-    pqsignal(SIGHUP, pgqbw_sighup);
-    pqsignal(SIGTERM, pgqbw_sigterm);
+    pqsignal(SIGHUP, sighup);
+    pqsignal(SIGTERM, sigterm);
     BackgroundWorkerUnblockSignals();
-    elog(LOG, "pgqbw_ticker finished");
+    BackgroundWorkerInitializeConnection(datname, usename, 0);
+    while (!got_sigterm) {
+        int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, min(retry_period, maint_period, ticker_period) * 1000L, PG_WAIT_EXTENSION);
+        ResetLatch(MyLatch);
+        if (rc & WL_POSTMASTER_DEATH) proc_exit(1);
+        if (got_sighup) {
+            got_sighup = false;
+            ProcessConfigFile(PGC_SIGHUP);
+        }
+    }
+    elog(LOG, "ticker finished");
     proc_exit(0);
 }
 
-static void initialize_pgqbw() {
+static void initialize_launcher() {
     int ret, ntup;
     bool isnull;
     StringInfoData buf;
@@ -89,7 +109,7 @@ static void launch_ticker(char *datname, char *usename) {
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = 10;
     snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
-    snprintf(worker.bgw_function_name, sizeof("pgqbw_ticker"), "pgqbw_ticker");
+    snprintf(worker.bgw_function_name, sizeof("ticker"), "ticker");
     snprintf(worker.bgw_name, BGW_MAXLEN, "%s %s ticker background worker", datname, usename);
     snprintf(worker.bgw_type, sizeof("ticker background worker"), "ticker background worker");
     snprintf(worker.bgw_extra + snprintf(worker.bgw_extra, strlen(datname) + 1, "%s", datname) + 1, strlen(usename) + 1, "%s", usename);
@@ -114,13 +134,13 @@ static void launch_ticker(char *datname, char *usename) {
     }
 }
 
-void pgqbw_main(Datum main_arg) {
+void launcher(Datum main_arg) {
     StringInfoData buf;
-    pqsignal(SIGHUP, pgqbw_sighup);
-    pqsignal(SIGTERM, pgqbw_sigterm);
+    pqsignal(SIGHUP, sighup);
+    pqsignal(SIGTERM, sigterm);
     BackgroundWorkerUnblockSignals();
     BackgroundWorkerInitializeConnection(initial_database, initial_username, 0);
-    initialize_pgqbw();
+    initialize_launcher();
     initStringInfo(&buf);
     appendStringInfo(&buf, "WITH subquery AS ( "
         "SELECT datname, usename, "
@@ -160,7 +180,7 @@ void pgqbw_main(Datum main_arg) {
         pgstat_report_stat(false);
         pgstat_report_activity(STATE_IDLE, NULL);
     }
-    elog(LOG, "pgqbw_main finished");
+    elog(LOG, "launcher finished");
     proc_exit(0);
 }
 
@@ -171,12 +191,15 @@ void _PG_init(void) {
     DefineCustomStringVariable("pgqbw.initial_database", "startup database to query other databases", NULL, &initial_database, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("pgqbw.initial_username", "startup username to query other databases", NULL, &initial_username, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.check_period", "how often to check for new databases", NULL, &check_period, 60, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("pgqbw.retry_period", "how often to flush retry queue", NULL, &retry_period, 30, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("pgqbw.maint_period", "how often to do maintentance", NULL, &maint_period, 120, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("pgqbw.ticker_period", "how often to run ticker", NULL, &ticker_period, 1, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     MemSet(&worker, 0, sizeof(BackgroundWorker));
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = 10;
     snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
-    snprintf(worker.bgw_function_name, sizeof("pgqbw_main"), "pgqbw_main");
+    snprintf(worker.bgw_function_name, sizeof("launcher"), "launcher");
     snprintf(worker.bgw_name, sizeof("queue background worker launcher"), "queue background worker launcher");
     snprintf(worker.bgw_type, sizeof("queue background worker launcher"), "queue background worker launcher");
     worker.bgw_notify_pid = 0;
