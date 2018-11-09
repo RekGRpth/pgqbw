@@ -82,7 +82,7 @@ void ticker(Datum arg) {
     char *sql;
     char *datname = MyBgworkerEntry->bgw_extra;
     char *usename = datname + strlen(datname) + 1;
-    elog(LOG, "datname=%s, usename=%s", datname, usename);
+    elog(LOG, "ticker started datname=%s, usename=%s", datname, usename);
     pqsignal(SIGHUP, sighup);
     pqsignal(SIGTERM, sigterm);
     BackgroundWorkerUnblockSignals();
@@ -117,7 +117,27 @@ void ticker(Datum arg) {
             next_ticker = time_time + ticker_period;
         }
         if (time_time >= next_maint) {
-            n_maint++;
+            SetCurrentStatementStartTimestamp();
+            StartTransactionCommand();
+            SPI_connect();
+            PushActiveSnapshot(GetTransactionSnapshot());
+            sql = "SELECT func_name, func_arg FROM pgq.maint_operations()";
+            pgstat_report_activity(STATE_RUNNING, sql);
+            ret = SPI_execute(sql, false, 0);
+            if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+            for (unsigned i = 0; i < SPI_processed; i++) {
+                bool isnull;
+                char *func_name = NULL, *func_arg = NULL;
+                func_name = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+                func_arg = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+                elog(LOG, "datname=%s, usename=%s, func_name=%s, func_arg=%s", datname, usename, func_name, func_arg);
+                n_maint++;
+            }
+            SPI_finish();
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+            pgstat_report_stat(false);
+            pgstat_report_activity(STATE_IDLE, NULL);
             next_maint = time_time + maint_period;
         }
         if (time_time >= next_retry) {
@@ -146,12 +166,9 @@ void ticker(Datum arg) {
         if (time_time >= next_stats) {
             elog(LOG, "datname=%s, usename=%s, time_time=%lu, n_ticks=%lu, n_maint=%lu, n_retry=%lu", datname, usename, time_time, n_ticks, n_maint, n_retry);
             next_stats = time_time + stats_period;
-            n_ticks = 0;
-            n_maint = 0;
-            n_retry = 0;
         }
     }
-    elog(LOG, "ticker finished");
+    elog(LOG, "ticker finished datname=%s, usename=%s", datname, usename);
     proc_exit(0);
 }
 
@@ -226,6 +243,7 @@ void launcher(Datum main_arg) {
         "WHERE NOT datistemplate "
         "AND datallowconn "
     ") SELECT datname, usename FROM subquery WHERE lock IS NOT NULL and lock";
+    elog(LOG, "launcher started initial_database=%s, initial_username=%s", initial_database, initial_username);
     pqsignal(SIGHUP, sighup);
     pqsignal(SIGTERM, sigterm);
     BackgroundWorkerUnblockSignals();
@@ -261,7 +279,7 @@ void launcher(Datum main_arg) {
         pgstat_report_stat(false);
         pgstat_report_activity(STATE_IDLE, NULL);
     }
-    elog(LOG, "launcher finished");
+    elog(LOG, "launcher finished initial_database=%s, initial_username=%s", initial_database, initial_username);
     proc_exit(0);
 }
 
