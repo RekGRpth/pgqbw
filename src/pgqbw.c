@@ -22,6 +22,7 @@ static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
 static char *initial_database = NULL;
 static char *initial_username = NULL;
+static int stats_period = 30;
 static int check_period = 60;
 static int retry_period = 30;
 static int maint_period = 120;
@@ -168,7 +169,7 @@ void launcher(Datum main_arg) {
     initStringInfo(&buf);
     appendStringInfo(&buf, "WITH subquery AS ( "
         "SELECT datname, usename, "
-        "(SELECT lock FROM dblink.dblink('dbname='||datname, 'SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = ''pgq'';') AS (lock bool)) AS lock "
+        "(SELECT lock FROM dblink.dblink('dbname='||datname||' user='||usename, 'SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = ''pgq'';') AS (lock bool)) AS lock "
         "FROM pg_database "
         "INNER JOIN pg_user ON usesysid = datdba "
         "WHERE NOT datistemplate "
@@ -214,6 +215,7 @@ void _PG_init(void) {
     if (!process_shared_preload_libraries_in_progress) ereport(ERROR, (errmsg("pgqbw can only be loaded via shared_preload_libraries"), errhint("Add pgqbw to the shared_preload_libraries configuration variable in postgresql.conf.")));
     DefineCustomStringVariable("pgqbw.initial_database", "startup database to query other databases", NULL, &initial_database, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("pgqbw.initial_username", "startup username to query other databases", NULL, &initial_username, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
+    DefineCustomIntVariable("pgqbw.stats_period", "how often to print statistics", NULL, &stats_period, 30, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.check_period", "how often to check for new databases", NULL, &check_period, 60, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.retry_period", "how often to flush retry queue", NULL, &retry_period, 30, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.maint_period", "how often to do maintentance", NULL, &maint_period, 120, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
