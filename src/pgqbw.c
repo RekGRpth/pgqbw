@@ -1,34 +1,28 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-/* These are always necessary for a bgworker */
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
-//#include "storage/latch.h"
-//#include "storage/lwlock.h"
-//#include "storage/proc.h"
-//#include "storage/shmem.h"
 
 #include "access/xact.h"
 #include "executor/spi.h"
 #include "utils/snapmgr.h"
 #include "pgstat.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 
 PG_MODULE_MAGIC;
 
 void _PG_init(void);
-//void _PG_fini(void);
 void pgqbw_main(Datum arg);
+void pgqbw_ticker(Datum arg);
 
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
-//static volatile sig_atomic_t got_sigusr1 = false;
 static char *initial_database = NULL;
 static char *initial_username = NULL;
 static int check_period = 60;
-//static emit_log_hook_type prev_log_hook = NULL;
 
 static void pgqbw_sighup(SIGNAL_ARGS) {
     int save_errno = errno;
@@ -44,12 +38,16 @@ static void pgqbw_sigterm(SIGNAL_ARGS) {
     errno = save_errno;
 }
 
-/*static void pgqbw_sigusr1(SIGNAL_ARGS) {
-    int save_errno = errno;
-    got_sigusr1 = true;
-    SetLatch(MyLatch);
-    errno = save_errno;
-}*/
+void pgqbw_ticker(Datum arg) {
+    char *datname = MyBgworkerEntry->bgw_extra;
+    char *usename = datname + strlen(datname) + 1;
+    elog(LOG, "datname=%s, usename=%s", datname, usename);
+    pqsignal(SIGHUP, pgqbw_sighup);
+    pqsignal(SIGTERM, pgqbw_sigterm);
+    BackgroundWorkerUnblockSignals();
+    elog(LOG, "pgqbw_ticker finished");
+    proc_exit(0);
+}
 
 static void initialize_pgqbw() {
     int ret, ntup;
@@ -81,11 +79,45 @@ static void initialize_pgqbw() {
     pgstat_report_activity(STATE_IDLE, NULL);
 }
 
+static void launch_ticker(char *datname, char *usename) {
+    BackgroundWorker worker;
+    BackgroundWorkerHandle *handle;
+    pid_t pid;
+    MemoryContext oldcontext;
+    MemSet(&worker, 0, sizeof(BackgroundWorker));
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+    worker.bgw_restart_time = 10;
+    snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
+    snprintf(worker.bgw_function_name, sizeof("pgqbw_ticker"), "pgqbw_ticker");
+    snprintf(worker.bgw_name, BGW_MAXLEN, "%s %s ticker background worker", datname, usename);
+    snprintf(worker.bgw_type, sizeof("ticker background worker"), "ticker background worker");
+    snprintf(worker.bgw_extra + snprintf(worker.bgw_extra, strlen(datname) + 1, "%s", datname) + 1, strlen(usename) + 1, "%s", usename);
+    worker.bgw_notify_pid = MyProcPid;
+    worker.bgw_main_arg = (Datum) 0;
+    oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+    if (!RegisterDynamicBackgroundWorker(&worker, &handle)) ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("could not register background process"), errhint("You may need to increase max_worker_processes.")));
+    MemoryContextSwitchTo(oldcontext);
+    switch (WaitForBackgroundWorkerStartup(handle, &pid)) {
+        case BGWH_STARTED: break;
+        case BGWH_STOPPED:
+            pfree(handle);
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("could not start background process"), errhint("More details may be available in the server log.")));
+            break;
+        case BGWH_POSTMASTER_DIED:
+            pfree(handle);
+            ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_RESOURCES), errmsg("cannot start background processes without postmaster"), errhint("Kill all remaining database processes and restart the database.")));
+            break;
+        default:
+            elog(ERROR, "unexpected bgworker handle status");
+            break;
+    }
+}
+
 void pgqbw_main(Datum main_arg) {
     StringInfoData buf;
     pqsignal(SIGHUP, pgqbw_sighup);
     pqsignal(SIGTERM, pgqbw_sigterm);
-//    pqsignal(SIGUSR1, pgqbw_sigusr1);
     BackgroundWorkerUnblockSignals();
     BackgroundWorkerInitializeConnection(initial_database, initial_username, 0);
     initialize_pgqbw();
@@ -98,27 +130,15 @@ void pgqbw_main(Datum main_arg) {
         "WHERE NOT datistemplate "
         "AND datallowconn "
     ") SELECT datname, usename FROM subquery WHERE nspname IS NOT NULL");
-//    EnableNotifyInterrupt();
-//    pgstat_report_activity(STATE_RUNNING, "background_worker");
-//    StartTransactionCommand();
-//    Async_Listen("foo");
-//    CommitTransactionCommand();
-//    pgstat_report_activity(STATE_IDLE, NULL);
     while (!got_sigterm) {
         int ret;
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, check_period * 1000L, PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
         if (rc & WL_POSTMASTER_DEATH) proc_exit(1);
-//        CHECK_FOR_INTERRUPTS();
         if (got_sighup) {
             got_sighup = false;
             ProcessConfigFile(PGC_SIGHUP);
         }
-        /*if (got_sigusr1) {
-            got_sigusr1 = false;
-            elog(INFO, " background_worker: notification received");
-            // DO SOME WORK WITH STORED NOTIFICATIONS
-        }*/
         SetCurrentStatementStartTimestamp();
         StartTransactionCommand();
         SPI_connect();
@@ -132,6 +152,7 @@ void pgqbw_main(Datum main_arg) {
             datname = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
             usename = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
             elog(LOG, "datname=%s, usename=%s", datname, usename);
+            launch_ticker(datname, usename);
         }
         SPI_finish();
         PopActiveSnapshot();
@@ -143,14 +164,10 @@ void pgqbw_main(Datum main_arg) {
     proc_exit(0);
 }
 
-/*static void store_notification(ErrorData *edata) {
-    // HERE STORE THE NOTIFICATION FROM SERVER LOG
-    if (prev_log_hook) (*prev_log_hook) (edata);
-}*/
-
 void _PG_init(void) {
     BackgroundWorker worker;
-    if (!process_shared_preload_libraries_in_progress) return;
+    if (IsBinaryUpgrade) return;
+    if (!process_shared_preload_libraries_in_progress) ereport(ERROR, (errmsg("pgqbw can only be loaded via shared_preload_libraries"), errhint("Add pgqbw to the shared_preload_libraries configuration variable in postgresql.conf.")));
     DefineCustomStringVariable("pgqbw.initial_database", "startup database to query other databases", NULL, &initial_database, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
     DefineCustomStringVariable("pgqbw.initial_username", "startup username to query other databases", NULL, &initial_username, "postgres", PGC_POSTMASTER, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("pgqbw.check_period", "how often to check for new databases", NULL, &check_period, 60, 1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
@@ -158,18 +175,11 @@ void _PG_init(void) {
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
     worker.bgw_restart_time = 10;
-    snprintf(worker.bgw_library_name, BGW_MAXLEN, "pgqbw");
-    snprintf(worker.bgw_function_name, BGW_MAXLEN, "pgqbw_main");
-    snprintf(worker.bgw_name, BGW_MAXLEN, "queue background worker");
-    snprintf(worker.bgw_type, BGW_MAXLEN, "queue background worker");
+    snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
+    snprintf(worker.bgw_function_name, sizeof("pgqbw_main"), "pgqbw_main");
+    snprintf(worker.bgw_name, sizeof("queue background worker launcher"), "queue background worker launcher");
+    snprintf(worker.bgw_type, sizeof("queue background worker launcher"), "queue background worker launcher");
     worker.bgw_notify_pid = 0;
-//    worker.bgw_main = pgqbw_main;
     worker.bgw_main_arg = (Datum) 0;
     RegisterBackgroundWorker(&worker);
-//    prev_log_hook = emit_log_hook;
-//    emit_log_hook = store_notification;
 }
-
-//void _PG_fini(void) {
-    //emit_log_hook = prev_log_hook;
-//}
