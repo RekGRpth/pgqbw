@@ -133,10 +133,10 @@ void ticker(Datum arg) {
                 char *func_arg = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
                 if (!strncasecmp(func_name, "vacuum", sizeof("vacuum") - 1)) {
                     appendStringInfo(&buf, "%s \"%s\";", func_name, func_arg);
-                } else if (func_arg == NULL) {
-                    appendStringInfo(&buf, "SELECT %s();", func_name);
-                } else {
+                } else if (func_arg != NULL) {
                     appendStringInfo(&buf, "SELECT %s('%s');", func_name, func_arg);
+                } else {
+                    appendStringInfo(&buf, "SELECT %s();", func_name);
                 }
                 elog(LOG, "datname=%s, usename=%s, buf.data=%s", datname, usename, buf.data);
                 if (func_name != NULL) pfree(func_name);
@@ -276,12 +276,12 @@ void launcher(Datum main_arg) {
         ret = SPI_execute(sql, false, 0);
         if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
         for (unsigned int i = 0; i < SPI_processed; i++) {
-            bool isnull;
-//            char *datname = NULL, *usename = NULL;
-            char *datname = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
-            char *usename = DatumGetCString(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull));
+            char *datname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+            char *usename = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
 //            elog(LOG, "datname=%s, usename=%s", datname, usename);
             launch_ticker(datname, usename);
+            if (datname != NULL) pfree(datname);
+            if (usename != NULL) pfree(usename);
         }
         SPI_finish();
         PopActiveSnapshot();
