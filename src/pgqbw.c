@@ -224,7 +224,7 @@ void _PG_init(void) {
     worker.bgw_restart_time = 10;
     snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw");
     snprintf(worker.bgw_function_name, sizeof("launcher"), "launcher");
-    snprintf(worker.bgw_name, sizeof("pgqbw launcher"), "pgqbw launcher");
+    snprintf(worker.bgw_name, BGW_MAXLEN, "%s %s pgqbw launcher", initial_database, initial_username);
     snprintf(worker.bgw_type, sizeof("pgqbw launcher"), "pgqbw launcher");
     worker.bgw_notify_pid = 0;
     worker.bgw_main_arg = (Datum) 0;
