@@ -60,16 +60,14 @@ static inline int min(int a, int b, int c) {
 static void initialize_ticker() {
     int ret;
     bool isnull, lock;
-    StringInfoData buf;
+    char *sql = "SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq'";
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
-    initStringInfo(&buf);
-    appendStringInfo(&buf, "SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq';");
-    pgstat_report_activity(STATE_RUNNING, buf.data);
-    ret = SPI_execute(buf.data, true, 0);
-    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: buf.data=%s, ret=%d", buf.data, ret);
+    pgstat_report_activity(STATE_RUNNING, sql);
+    ret = SPI_execute(sql, true, 0);
+    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
     lock = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
     if (isnull) elog(FATAL, "isnull");
@@ -81,6 +79,7 @@ static void initialize_ticker() {
 }
 
 void ticker(Datum arg) {
+    char *sql;
     char *datname = MyBgworkerEntry->bgw_extra;
     char *usename = datname + strlen(datname) + 1;
     elog(LOG, "datname=%s, usename=%s", datname, usename);
@@ -90,6 +89,7 @@ void ticker(Datum arg) {
     BackgroundWorkerInitializeConnection(datname, usename, 0);
     initialize_ticker();
     while (!got_sigterm) {
+        int ret;
         int period = min(retry_period, maint_period, ticker_period);
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, period * 1000L, PG_WAIT_EXTENSION);
         ResetLatch(MyLatch);
@@ -99,17 +99,30 @@ void ticker(Datum arg) {
             got_sighup = false;
             ProcessConfigFile(PGC_SIGHUP);
         }
-        if (time_time >= next_retry) {
-            n_retry++;
-            next_retry = time_time + retry_period;
+        if (time_time >= next_ticker) {
+            SetCurrentStatementStartTimestamp();
+            StartTransactionCommand();
+            SPI_connect();
+            PushActiveSnapshot(GetTransactionSnapshot());
+            sql = "SELECT pgq.ticker()";
+            pgstat_report_activity(STATE_RUNNING, sql);
+            ret = SPI_execute(sql, false, 0);
+            if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+            if (SPI_processed == 1) n_ticks++;
+            SPI_finish();
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+            pgstat_report_stat(false);
+            pgstat_report_activity(STATE_IDLE, NULL);
+            next_ticker = time_time + ticker_period;
         }
         if (time_time >= next_maint) {
             n_maint++;
             next_maint = time_time + maint_period;
         }
-        if (time_time >= next_ticker) {
-            n_ticks++;
-            next_ticker = time_time + ticker_period;
+        if (time_time >= next_retry) {
+            n_retry++;
+            next_retry = time_time + retry_period;
         }
         if (time_time >= next_stats) {
             elog(LOG, "datname=%s, usename=%s, time_time=%lu, n_ticks=%lu, n_maint=%lu, n_retry=%lu", datname, usename, time_time, n_ticks, n_maint, n_retry);
@@ -123,26 +136,23 @@ void ticker(Datum arg) {
 static void initialize_launcher() {
     int ret, ntup;
     bool isnull;
-    StringInfoData buf;
+    char *sql = "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'dblink'";
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
     SPI_connect();
     PushActiveSnapshot(GetTransactionSnapshot());
-    initStringInfo(&buf);
-    appendStringInfo(&buf, "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'dblink'");
-    pgstat_report_activity(STATE_RUNNING, buf.data);
-    ret = SPI_execute(buf.data, true, 0);
-    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: buf.data=%s, ret=%d", buf.data, ret);
+    pgstat_report_activity(STATE_RUNNING, sql);
+    ret = SPI_execute(sql, true, 0);
+    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
     ntup = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
     if (isnull) elog(FATAL, "isnull");
     if (ntup == 0) {
-        resetStringInfo(&buf);
-        appendStringInfo(&buf, "CREATE SCHEMA IF NOT EXISTS dblink; CREATE EXTENSION IF NOT EXISTS dblink SCHEMA dblink;");
-        pgstat_report_activity(STATE_RUNNING, buf.data);
+        sql = "CREATE SCHEMA IF NOT EXISTS dblink; CREATE EXTENSION IF NOT EXISTS dblink SCHEMA dblink";
+        pgstat_report_activity(STATE_RUNNING, sql);
         SetCurrentStatementStartTimestamp();
-        ret = SPI_execute(buf.data, false, 0);
-        if (ret != SPI_OK_UTILITY) elog(FATAL, "ret != SPI_OK_UTILITY: buf.data=%s, ret=%d", buf.data, ret);
+        ret = SPI_execute(sql, false, 0);
+        if (ret != SPI_OK_UTILITY) elog(FATAL, "ret != SPI_OK_UTILITY: sql=%s, ret=%d", sql, ret);
     }
     SPI_finish();
     PopActiveSnapshot();
@@ -186,21 +196,19 @@ static void launch_ticker(char *datname, char *usename) {
 }
 
 void launcher(Datum main_arg) {
-    StringInfoData buf;
-    pqsignal(SIGHUP, sighup);
-    pqsignal(SIGTERM, sigterm);
-    BackgroundWorkerUnblockSignals();
-    BackgroundWorkerInitializeConnection(initial_database, initial_username, 0);
-    initialize_launcher();
-    initStringInfo(&buf);
-    appendStringInfo(&buf, "WITH subquery AS ( "
+    char *sql = "WITH subquery AS ( "
         "SELECT datname, usename, "
         "(SELECT lock FROM dblink.dblink('dbname='||datname||' user='||usename, 'SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = ''pgq'';') AS (lock bool)) AS lock "
         "FROM pg_database "
         "INNER JOIN pg_user ON usesysid = datdba "
         "WHERE NOT datistemplate "
         "AND datallowconn "
-    ") SELECT datname, usename FROM subquery WHERE lock IS NOT NULL and lock");
+    ") SELECT datname, usename FROM subquery WHERE lock IS NOT NULL and lock";
+    pqsignal(SIGHUP, sighup);
+    pqsignal(SIGTERM, sigterm);
+    BackgroundWorkerUnblockSignals();
+    BackgroundWorkerInitializeConnection(initial_database, initial_username, 0);
+    initialize_launcher();
     while (!got_sigterm) {
         int ret;
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, check_period * 1000L, PG_WAIT_EXTENSION);
@@ -214,9 +222,9 @@ void launcher(Datum main_arg) {
         StartTransactionCommand();
         SPI_connect();
         PushActiveSnapshot(GetTransactionSnapshot());
-        pgstat_report_activity(STATE_RUNNING, buf.data);
-        ret = SPI_execute(buf.data, false, 0);
-        if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: buf.data=%s, ret=%d", buf.data, ret);
+        pgstat_report_activity(STATE_RUNNING, sql);
+        ret = SPI_execute(sql, false, 0);
+        if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
         for (unsigned i = 0; i < SPI_processed; i++) {
             bool isnull;
             char *datname = NULL, *usename = NULL;
