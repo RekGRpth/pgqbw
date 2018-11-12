@@ -195,7 +195,7 @@ static inline void launch_ticker(char *datname, char *usename) {
     MemSet(&worker, 0, sizeof(BackgroundWorker));
     worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
     worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-    worker.bgw_restart_time = 10;
+    worker.bgw_restart_time = BGW_NEVER_RESTART;
     if (snprintf(worker.bgw_library_name, sizeof("pgqbw"), "pgqbw") != sizeof("pgqbw") - 1) elog(FATAL, "snprintf");
     if (snprintf(worker.bgw_function_name, sizeof("ticker"), "ticker") != sizeof("ticker") - 1) elog(FATAL, "snprintf");
     len = sizeof("%s %s pgqbw worker") - 1 + strlen(datname) - 1 + strlen(usename) - 1 - 2;
