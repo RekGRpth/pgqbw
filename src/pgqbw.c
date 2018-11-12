@@ -183,6 +183,9 @@ void ticker(Datum arg) {
         if (time_time >= next_stats) {
             elog(LOG, "datname=%s, usename=%s, time_time=%lu, n_ticks=%lu, n_maint=%lu, n_retry=%lu", datname, usename, time_time, n_ticks, n_maint, n_retry);
             next_stats = time_time + stats_period;
+            n_ticks = 0;
+            n_maint = 0;
+            n_retry = 0;
         }
     }
     elog(LOG, "ticker finished datname=%s, usename=%s", datname, usename);
