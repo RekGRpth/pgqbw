@@ -57,26 +57,34 @@ static inline int min(int a, int b, int c) {
     return m;
 }
 
-static void initialize_ticker() {
-    int ret;
-    bool isnull, lock;
-    char *sql = "SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq'";
+static void connect_my(char *sql) {
     (void)SetCurrentStatementStartTimestamp();
     (void)StartTransactionCommand();
     if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
     (void)PushActiveSnapshot(GetTransactionSnapshot());
     (void)pgstat_report_activity(STATE_RUNNING, sql);
+}
+
+static void finish_my() {
+    if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
+    (void)PopActiveSnapshot();
+    (void)CommitTransactionCommand();
+    (void)pgstat_report_stat(false);
+    (void)pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+static void initialize_ticker() {
+    int ret;
+    bool isnull, lock;
+    char *sql = "SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq'";
+    (void)connect_my(sql);
     ret = SPI_execute(sql, false, 0);
     if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
     lock = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
     if (isnull) elog(FATAL, "isnull");
     if (!lock) elog(FATAL, "already running");
-    if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
-    (void)PopActiveSnapshot();
-    (void)CommitTransactionCommand();
-    (void)pgstat_report_stat(false);
-    (void)pgstat_report_activity(STATE_IDLE, NULL);
+    (void)finish_my();
 }
 
 void ticker(Datum arg) {
@@ -103,29 +111,17 @@ void ticker(Datum arg) {
             (void)ProcessConfigFile(PGC_SIGHUP);
         }
         if (time_time >= next_ticker) {
-            (void)SetCurrentStatementStartTimestamp();
-            (void)StartTransactionCommand();
-            if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
-            (void)PushActiveSnapshot(GetTransactionSnapshot());
             sql = "SELECT pgq.ticker()";
-            (void)pgstat_report_activity(STATE_RUNNING, sql);
+            (void)connect_my(sql);
             ret = SPI_execute(sql, false, 0);
             if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
             if (SPI_processed == 1) n_ticks++;
-            if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
-            (void)PopActiveSnapshot();
-            (void)CommitTransactionCommand();
-            (void)pgstat_report_stat(false);
-            (void)pgstat_report_activity(STATE_IDLE, NULL);
+            (void)finish_my();
             next_ticker = time_time + ticker_period;
         }
         if (time_time >= next_maint) {
-            (void)SetCurrentStatementStartTimestamp();
-            (void)StartTransactionCommand();
-            if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
-            (void)PushActiveSnapshot(GetTransactionSnapshot());
             sql = "SELECT func_name, func_arg FROM pgq.maint_operations()";
-            (void)pgstat_report_activity(STATE_RUNNING, sql);
+            (void)connect_my(sql);
             ret = SPI_execute(sql, false, 0);
             if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
             (void)resetStringInfo(&buf);
@@ -151,20 +147,12 @@ void ticker(Datum arg) {
                 ret = SPI_execute(sql, false, 0);
                 if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
             }
-            if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
-            (void)PopActiveSnapshot();
-            (void)CommitTransactionCommand();
-            (void)pgstat_report_stat(false);
-            (void)pgstat_report_activity(STATE_IDLE, NULL);
+            (void)finish_my();
             next_maint = time_time + maint_period;
         }
         if (time_time >= next_retry) {
-            (void)SetCurrentStatementStartTimestamp();
-            (void)StartTransactionCommand();
-            if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
-            (void)PushActiveSnapshot(GetTransactionSnapshot());
             sql = "SELECT * FROM pgq.maint_retry_events()";
-            (void)pgstat_report_activity(STATE_RUNNING, sql);
+            (void)connect_my(sql);
             for (int retry = 1; retry; ) {
                 int ret = SPI_execute(sql, false, 0);
                 if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
@@ -174,11 +162,7 @@ void ticker(Datum arg) {
                     n_retry += retry;
                 } else retry = 0;
             }
-            if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
-            (void)PopActiveSnapshot();
-            (void)CommitTransactionCommand();
-            (void)pgstat_report_stat(false);
-            (void)pgstat_report_activity(STATE_IDLE, NULL);
+            (void)finish_my();
             next_retry = time_time + retry_period;
         }
         if (time_time >= next_stats) {
@@ -197,11 +181,7 @@ static void initialize_launcher() {
     int ret, ntup;
     bool isnull;
     char *sql = "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'dblink'";
-    (void)SetCurrentStatementStartTimestamp();
-    (void)StartTransactionCommand();
-    if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
-    (void)PushActiveSnapshot(GetTransactionSnapshot());
-    (void)pgstat_report_activity(STATE_RUNNING, sql);
+    (void)connect_my(sql);
     ret = SPI_execute(sql, false, 0);
     if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
@@ -210,15 +190,10 @@ static void initialize_launcher() {
     if (ntup == 0) {
         sql = "CREATE SCHEMA IF NOT EXISTS dblink; CREATE EXTENSION IF NOT EXISTS dblink SCHEMA dblink";
         (void)pgstat_report_activity(STATE_RUNNING, sql);
-        (void)SetCurrentStatementStartTimestamp();
         ret = SPI_execute(sql, false, 0);
         if (ret != SPI_OK_UTILITY) elog(FATAL, "ret != SPI_OK_UTILITY: sql=%s, ret=%d", sql, ret);
     }
-    if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
-    (void)PopActiveSnapshot();
-    (void)CommitTransactionCommand();
-    (void)pgstat_report_stat(false);
-    (void)pgstat_report_activity(STATE_IDLE, NULL);
+    (void)finish_my();
 }
 
 static void launch_ticker(char *datname, char *usename) {
@@ -283,11 +258,7 @@ void launcher(Datum main_arg) {
             got_sighup = false;
             (void)ProcessConfigFile(PGC_SIGHUP);
         }
-        (void)SetCurrentStatementStartTimestamp();
-        (void)StartTransactionCommand();
-        if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
-        (void)PushActiveSnapshot(GetTransactionSnapshot());
-        (void)pgstat_report_activity(STATE_RUNNING, sql);
+        (void)connect_my(sql);
         ret = SPI_execute(sql, false, 0);
         if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
         for (unsigned int i = 0; i < SPI_processed; i++) {
@@ -298,11 +269,7 @@ void launcher(Datum main_arg) {
             if (datname != NULL) (void)pfree(datname);
             if (usename != NULL) (void)pfree(usename);
         }
-        if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
-        (void)PopActiveSnapshot();
-        (void)CommitTransactionCommand();
-        (void)pgstat_report_stat(false);
-        (void)pgstat_report_activity(STATE_IDLE, NULL);
+        (void)finish_my();
     }
     elog(LOG, "launcher finished initial_database=%s, initial_username=%s", initial_database, initial_username);
     (void)proc_exit(0);
