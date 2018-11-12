@@ -36,14 +36,14 @@ static unsigned long int n_ticks = 0;
 static unsigned long int n_maint = 0;
 static unsigned long int n_retry = 0;
 
-static void sighup(SIGNAL_ARGS) {
+static inline void sighup(SIGNAL_ARGS) {
     int save_errno = errno;
     got_sighup = true;
     SetLatch(MyLatch);
     errno = save_errno;
 }
 
-static void sigterm(SIGNAL_ARGS) {
+static inline void sigterm(SIGNAL_ARGS) {
     int save_errno = errno;
     got_sigterm = true;
     (void)SetLatch(MyLatch);
@@ -57,39 +57,43 @@ static inline int min(int a, int b, int c) {
     return m;
 }
 
-static void connect_my(char *sql) {
+static inline void connect_my() {
     (void)SetCurrentStatementStartTimestamp();
     (void)StartTransactionCommand();
     if (SPI_connect() != SPI_OK_CONNECT) elog(FATAL, "SPI_connect != SPI_OK_CONNECT");
     (void)PushActiveSnapshot(GetTransactionSnapshot());
-    (void)pgstat_report_activity(STATE_RUNNING, sql);
 }
 
-static void finish_my() {
+static inline int execute_my(char *sql) {
+    int ret;
+    (void)pgstat_report_activity(STATE_RUNNING, sql);
+    ret = SPI_execute(sql, false, 0);
+    (void)pgstat_report_activity(STATE_IDLE, NULL);
+    (void)pgstat_report_stat(false);
+    return ret;
+}
+
+static inline void finish_my() {
     if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
     (void)PopActiveSnapshot();
     (void)CommitTransactionCommand();
-    (void)pgstat_report_stat(false);
-    (void)pgstat_report_activity(STATE_IDLE, NULL);
 }
 
-static void initialize_ticker() {
-    int ret;
-    bool isnull, lock;
-    char *sql = "SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq'";
-    (void)connect_my(sql);
-    ret = SPI_execute(sql, false, 0);
-    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+static inline void initialize_ticker() {
+    (void)connect_my();
+    if (execute_my("SELECT pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) FROM pg_database, pg_namespace WHERE datname = current_catalog AND nspname = 'pgq'") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
-    lock = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
-    if (isnull) elog(FATAL, "isnull");
-    if (!lock) elog(FATAL, "already running");
+    else {
+        bool isnull;
+        bool lock = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+        if (isnull) elog(FATAL, "isnull");
+        if (!lock) elog(FATAL, "already running");
+    }
     (void)finish_my();
 }
 
 void ticker(Datum arg) {
     StringInfoData buf;
-    char *sql;
     char *datname = MyBgworkerEntry->bgw_extra;
     char *usename = datname + strlen(datname) + 1;
     elog(LOG, "ticker started datname=%s, usename=%s", datname, usename);
@@ -100,30 +104,25 @@ void ticker(Datum arg) {
     (void)initialize_ticker();
     (void)initStringInfo(&buf);
     while (!got_sigterm) {
-        int ret;
         int period = min(retry_period, maint_period, ticker_period);
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, period * 1000L, PG_WAIT_EXTENSION);
         (void)ResetLatch(MyLatch);
-        if (rc & WL_POSTMASTER_DEATH) (void)proc_exit(1);
+        if (rc & WL_POSTMASTER_DEATH) return (void)proc_exit(1);
         if (rc & WL_TIMEOUT) time_time += period;
         if (got_sighup) {
             got_sighup = false;
             (void)ProcessConfigFile(PGC_SIGHUP);
         }
         if (time_time >= next_ticker) {
-            sql = "SELECT pgq.ticker()";
-            (void)connect_my(sql);
-            ret = SPI_execute(sql, false, 0);
-            if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+            (void)connect_my();
+            if (execute_my("SELECT pgq.ticker()") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
             if (SPI_processed == 1) n_ticks++;
             (void)finish_my();
             next_ticker = time_time + ticker_period;
         }
         if (time_time >= next_maint) {
-            sql = "SELECT func_name, func_arg FROM pgq.maint_operations()";
-            (void)connect_my(sql);
-            ret = SPI_execute(sql, false, 0);
-            if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+            (void)connect_my();
+            if (execute_my("SELECT func_name, func_arg FROM pgq.maint_operations()") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
             (void)resetStringInfo(&buf);
             for (unsigned int i = 0; i < SPI_processed; i++) {
                 char *func_name = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
@@ -135,27 +134,21 @@ void ticker(Datum arg) {
                 } else {
                     appendStringInfo(&buf, "SELECT %s();", func_name);
                 }
-//                elog(LOG, "datname=%s, usename=%s, buf.data=%s", datname, usename, buf.data);
                 if (func_name != NULL) (void)pfree(func_name);
                 if (func_arg != NULL) (void)pfree(func_arg);
                 n_maint++;
             }
             if (buf.len > 0) {
-                sql = buf.data;
-                elog(LOG, "datname=%s, usename=%s, sql=%s", datname, usename, sql);
-                (void)pgstat_report_activity(STATE_RUNNING, sql);
-                ret = SPI_execute(sql, false, 0);
-                if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+                elog(LOG, "datname=%s, usename=%s, buf.data=%s", datname, usename, buf.data);
+                if (execute_my(buf.data) != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
             }
             (void)finish_my();
             next_maint = time_time + maint_period;
         }
         if (time_time >= next_retry) {
-            sql = "SELECT * FROM pgq.maint_retry_events()";
-            (void)connect_my(sql);
+            (void)connect_my();
             for (int retry = 1; retry; ) {
-                int ret = SPI_execute(sql, false, 0);
-                if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+                if (execute_my("SELECT * FROM pgq.maint_retry_events()") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
                 if (SPI_processed == 1) {
                     bool isnull;
                     retry = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
@@ -174,29 +167,23 @@ void ticker(Datum arg) {
         }
     }
     elog(LOG, "ticker finished datname=%s, usename=%s", datname, usename);
-    (void)proc_exit(0);
+    (void)proc_exit(1);
 }
 
-static void initialize_launcher() {
-    int ret, ntup;
-    bool isnull;
-    char *sql = "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'dblink'";
-    (void)connect_my(sql);
-    ret = SPI_execute(sql, false, 0);
-    if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+static inline void initialize_launcher() {
+    (void)connect_my();
+    if (execute_my("SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'dblink'") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
     if (SPI_processed != 1) elog(FATAL, "SPI_processed != 1");
-    ntup = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
-    if (isnull) elog(FATAL, "isnull");
-    if (ntup == 0) {
-        sql = "CREATE SCHEMA IF NOT EXISTS dblink; CREATE EXTENSION IF NOT EXISTS dblink SCHEMA dblink";
-        (void)pgstat_report_activity(STATE_RUNNING, sql);
-        ret = SPI_execute(sql, false, 0);
-        if (ret != SPI_OK_UTILITY) elog(FATAL, "ret != SPI_OK_UTILITY: sql=%s, ret=%d", sql, ret);
+    else {
+        bool isnull;
+        int ntup = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+        if (isnull) elog(FATAL, "isnull");
+        if ((ntup == 0) && (execute_my("CREATE SCHEMA IF NOT EXISTS dblink; CREATE EXTENSION IF NOT EXISTS dblink SCHEMA dblink") != SPI_OK_UTILITY)) elog(FATAL, "execute_my != SPI_OK_UTILITY");
     }
     (void)finish_my();
 }
 
-static void launch_ticker(char *datname, char *usename) {
+static inline void launch_ticker(char *datname, char *usename) {
     BackgroundWorker worker;
     BackgroundWorkerHandle *handle;
     pid_t pid;
@@ -235,14 +222,6 @@ static void launch_ticker(char *datname, char *usename) {
 }
 
 void launcher(Datum main_arg) {
-    char *sql = "WITH subquery AS ( "
-        "SELECT datname, "
-        "(SELECT usename FROM dblink.dblink('dbname='||datname||' user='||usename, 'SELECT case when pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) then usename else null end as usename FROM pg_database, pg_namespace, pg_user WHERE datname = current_catalog AND nspname = ''pgq'' and usesysid = nspowner') AS (usename name)) AS usename "
-        "FROM pg_database "
-        "INNER JOIN pg_user ON usesysid = datdba "
-        "WHERE NOT datistemplate "
-        "AND datallowconn "
-    ") SELECT datname, usename FROM subquery WHERE usename IS NOT NULL";
     elog(LOG, "launcher started initial_database=%s, initial_username=%s", initial_database, initial_username);
     pqsignal(SIGHUP, sighup);
     pqsignal(SIGTERM, sigterm);
@@ -250,21 +229,25 @@ void launcher(Datum main_arg) {
     (void)BackgroundWorkerInitializeConnection(initial_database, initial_username, 0);
     (void)initialize_launcher();
     while (!got_sigterm) {
-        int ret;
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, check_period * 1000L, PG_WAIT_EXTENSION);
         (void)ResetLatch(MyLatch);
-        if (rc & WL_POSTMASTER_DEATH) (void)proc_exit(1);
+        if (rc & WL_POSTMASTER_DEATH) return (void)proc_exit(1);
         if (got_sighup) {
             got_sighup = false;
             (void)ProcessConfigFile(PGC_SIGHUP);
         }
-        (void)connect_my(sql);
-        ret = SPI_execute(sql, false, 0);
-        if (ret != SPI_OK_SELECT) elog(FATAL, "ret != SPI_OK_SELECT: sql=%s, ret=%d", sql, ret);
+        (void)connect_my();
+        if (execute_my("WITH subquery AS ( "
+            "SELECT datname, "
+            "(SELECT usename FROM dblink.dblink('dbname='||datname||' user='||usename, 'SELECT case when pg_try_advisory_lock(pg_database.oid::INT, pg_namespace.oid::INT) then usename else null end as usename FROM pg_database, pg_namespace, pg_user WHERE datname = current_catalog AND nspname = ''pgq'' and usesysid = nspowner') AS (usename name)) AS usename "
+            "FROM pg_database "
+            "INNER JOIN pg_user ON usesysid = datdba "
+            "WHERE NOT datistemplate "
+            "AND datallowconn "
+        ") SELECT datname, usename FROM subquery WHERE usename IS NOT NULL") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
         for (unsigned int i = 0; i < SPI_processed; i++) {
             char *datname = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
             char *usename = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
-//            elog(LOG, "datname=%s, usename=%s", datname, usename);
             (void)launch_ticker(datname, usename);
             if (datname != NULL) (void)pfree(datname);
             if (usename != NULL) (void)pfree(usename);
@@ -272,7 +255,7 @@ void launcher(Datum main_arg) {
         (void)finish_my();
     }
     elog(LOG, "launcher finished initial_database=%s, initial_username=%s", initial_database, initial_username);
-    (void)proc_exit(0);
+    (void)proc_exit(1);
 }
 
 void _PG_init(void) {
