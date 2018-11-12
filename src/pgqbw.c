@@ -11,6 +11,7 @@
 #include "pgstat.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
+#include "commands/async.h"
 
 PG_MODULE_MAGIC;
 
@@ -77,6 +78,7 @@ static inline void finish_my() {
     if (SPI_finish() != SPI_OK_FINISH) elog(FATAL, "SPI_finish != SPI_OK_FINISH");
     (void)PopActiveSnapshot();
     (void)CommitTransactionCommand();
+    (void)ProcessCompletedNotifies();
 }
 
 static inline void initialize_ticker() {
@@ -107,12 +109,13 @@ void ticker(Datum arg) {
         int period = min(retry_period, maint_period, ticker_period);
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, period * 1000L, PG_WAIT_EXTENSION);
         (void)ResetLatch(MyLatch);
-        if (rc & WL_POSTMASTER_DEATH) return (void)proc_exit(1);
-        if (rc & WL_TIMEOUT) time_time += period;
+        if (rc & WL_POSTMASTER_DEATH) (void)proc_exit(1);
+        if (got_sigterm) (void)proc_exit(0);
         if (got_sighup) {
             got_sighup = false;
             (void)ProcessConfigFile(PGC_SIGHUP);
         }
+        if (rc & WL_TIMEOUT) time_time += period;
         if (time_time >= next_ticker) {
             (void)connect_my();
             if (execute_my("SELECT pgq.ticker()") != SPI_OK_SELECT) elog(FATAL, "execute_my != SPI_OK_SELECT");
@@ -166,7 +169,7 @@ void ticker(Datum arg) {
             n_retry = 0;
         }
     }
-    elog(LOG, "ticker finished datname=%s, usename=%s", datname, usename);
+//    elog(LOG, "ticker finished datname=%s, usename=%s", datname, usename);
     (void)proc_exit(1);
 }
 
@@ -231,7 +234,8 @@ void launcher(Datum main_arg) {
     while (!got_sigterm) {
         int rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, check_period * 1000L, PG_WAIT_EXTENSION);
         (void)ResetLatch(MyLatch);
-        if (rc & WL_POSTMASTER_DEATH) return (void)proc_exit(1);
+        if (rc & WL_POSTMASTER_DEATH) (void)proc_exit(1);
+        if (got_sigterm) (void)proc_exit(0);
         if (got_sighup) {
             got_sighup = false;
             (void)ProcessConfigFile(PGC_SIGHUP);
@@ -254,7 +258,7 @@ void launcher(Datum main_arg) {
         }
         (void)finish_my();
     }
-    elog(LOG, "launcher finished initial_database=%s, initial_username=%s", initial_database, initial_username);
+//    elog(LOG, "launcher finished initial_database=%s, initial_username=%s", initial_database, initial_username);
     (void)proc_exit(1);
 }
 
